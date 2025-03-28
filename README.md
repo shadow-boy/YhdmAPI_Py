@@ -2,6 +2,10 @@
 
 A Python API wrapper for YHDM (樱花动漫), providing easy access to anime streaming content from the platform.
 
+##  app参考:
+
+`https://github.com/xioneko/neko-anime`
+
 ## Features
 
 - Search for anime content on YHDM
