@@ -41,6 +41,16 @@ class AnimeShell:
     status: str
 
 @dataclass
+class Episode:
+    id: int  # 分集ID（数字）
+    title: str  # 分集标题（显示文本）
+
+@dataclass
+class StreamLine:
+    id: int  # 播放线路ID
+    episodes: List[Episode]  # 该线路的分集列表
+
+@dataclass
 class Anime:
     id: int
     name: str
@@ -51,8 +61,19 @@ class Anime:
     type: str
     year: str
     description: str
-    stream_ids: set
+    stream_lines: List[StreamLine]  # 改用stream_lines替代stream_ids
     last_update: datetime
+
+    def get_stream_ids(self) -> set:
+        """获取所有播放线路ID的集合"""
+        return {line.id for line in self.stream_lines}
+
+    def get_episodes(self, stream_id: int) -> Optional[List[Episode]]:
+        """获取指定播放线路的分集列表"""
+        for line in self.stream_lines:
+            if line.id == stream_id:
+                return line.episodes
+        return None
 
 class YhdmApi:
     """
@@ -65,7 +86,7 @@ class YhdmApi:
             "Referer": YHDM_API_BASE_URL
         })
 
-    def get_home_page(self):
+    def get_homepage(self):
         """获取首页内容"""
         try:
             response = requests.get(YHDM_API_BASE_URL, headers=self.session.headers)
@@ -86,6 +107,14 @@ class YhdmApi:
                 link = title_link.get('href', '')
                 if link and not link.startswith('http'):
                     link = YHDM_API_BASE_URL + link
+                    
+                # 从链接中提取动漫ID
+                anime_id = 0
+                if link:
+                    try:
+                        anime_id = int(link.split('/')[-2])
+                    except (ValueError, IndexError):
+                        pass
                     
                 # 获取图片 URL
                 image_url = title_link.get('data-original', '')
@@ -109,6 +138,7 @@ class YhdmApi:
                         desc = desc_p.text.strip()
                 
                 results.append({
+                    'id': anime_id,
                     'title': title,
                     'link': link,
                     'image_url': image_url,
@@ -151,7 +181,7 @@ class YhdmApi:
                 ))
         return results
 
-    def get_search_suggests(self, keyword: str, limit: int = 10) -> List[str]:
+    def get_search_suggestions(self, keyword: str, limit: int = 10) -> List[str]:
         """获取搜索建议"""
         params = {
             "mid": 1,
@@ -199,52 +229,108 @@ class YhdmApi:
             type = soup.select_one("ul.top_nav > li.active").text.strip()
             
             # 获取播放列表
-            play_list = soup.select("div.playlist_full")
-            latest_episode = 0
-            stream_ids = set()
+            latest_episode = None
+            stream_lines = []
+            seen_stream_ids = set()  # 用于跟踪已经添加的线路ID
             
-            for div in play_list:
-                a = div.select_one("a")
-                if not a:
-                    continue
-                    
-                if type != "动漫电影" and not a.text.startswith("第"):
-                    continue
-                    
-                sid = int(a['href'].split('/')[-2])
-                stream_ids.add(sid)
+            # 调试信息
+            print(f"\n解析动漫 {anime_id} 的播放列表:")
+            
+            # 获取所有分集列表
+            episode_lists = soup.select("ul.content_playlist")
+            print(f"找到 {len(episode_lists)} 个分集列表")
+            
+            for i, episode_list in enumerate(episode_lists):
+                print(f"\n处理第 {i+1} 个分集列表:")
                 
-                if type == "动漫电影":
-                    latest_episode = 1
-                else:
-                    episode_count = len(div.select("a"))
-                    latest_episode = max(episode_count, latest_episode)
+                # 获取该列表中的所有分集链接
+                episode_links = episode_list.select("a")
+                if not episode_links:
+                    print("未找到分集链接，跳过此列表")
+                    continue
+                
+                # 从第一个分集链接的href中提取线路ID
+                first_link = episode_links[0]
+                href = first_link.get('href', '')
+                match = re.search(r'/sid/(\d+)/', href)
+                if not match:
+                    print(f"无法从链接中提取线路ID: {href}")
+                    continue
+                
+                stream_id = int(match.group(1))
+                
+                # 检查是否已经添加过这个线路ID
+                if stream_id in seen_stream_ids:
+                    print(f"线路ID {stream_id} 已存在，跳过")
+                    continue
+                
+                seen_stream_ids.add(stream_id)
+                print(f"从链接提取到线路ID: {stream_id}")
+                
+                # 生成分集列表
+                episodes = []
+                episode_id = 1
+                for link in episode_links:
+                    episode_title = link.text.strip()
+                    if episode_title:  # 只要标题不为空就添加
+                        episodes.append(Episode(id=episode_id, title=episode_title))
+                        episode_id += 1
+                
+                # 计算实际集数（只计算以"第"开头的链接）
+                regular_episodes = [ep for ep in episodes if ep.title.startswith("第")]
+                special_episodes = [ep for ep in episodes if not ep.title.startswith("第")]
+                
+                # 更新最新集数（只考虑常规集数）
+                if type != "动漫电影":
+                    latest_episode = max(len(regular_episodes), latest_episode or 0)
+                
+                # 添加播放线路信息
+                stream_lines.append(StreamLine(id=stream_id, episodes=episodes))
+                print(f"线路 {stream_id} 添加了 {len(episodes)} 个分集 (常规: {len(regular_episodes)}, 特别篇: {len(special_episodes)})")
+            
+            print(f"最终获取到的播放线路数量: {len(stream_lines)}")
+            for line in stream_lines:
+                regular_count = len([ep for ep in line.episodes if ep.title.startswith("第")])
+                special_count = len([ep for ep in line.episodes if not ep.title.startswith("第")])
+                print(f"线路 {line.id}: {len(line.episodes)} 个分集 (常规: {regular_count}, 特别篇: {special_count})")
             
             return Anime(
                 id=anime_id,
                 name=name,
                 image_url=image_url,
                 status=status,
-                latest_episode=latest_episode,
+                latest_episode=latest_episode or 1 if type == "动漫电影" else latest_episode or 0,
                 tags=tags,
                 type=type if type else "未知",
                 year=year if year else "未知",
                 description=description,
-                stream_ids=stream_ids,
+                stream_lines=stream_lines,
                 last_update=datetime.now()
             )
         except Exception as e:
             print(f"解析动漫详情失败: {e}")
             return None
 
-    def filter_anime_by(self, 
-                       type: int = 1,
-                       order_by: str = "time",
-                       genre: str = "",
-                       year: str = "",
-                       letter: str = "",
-                       page: int = 1) -> List[AnimeShell]:
-        """按条件筛选动漫"""
+    def filter_anime(self, 
+                    type: int = 1,
+                    order_by: str = "time",
+                    genre: str = "",
+                    year: str = "",
+                    letter: str = "",
+                    page: int = 1) -> List[AnimeShell]:
+        """按条件筛选动漫
+        
+        Args:
+            type (int, optional): 动漫类型. 1=新番连载, 2=完结动漫, 3=动漫电影, 4=剧场OVA. 默认为1.
+            order_by (str, optional): 排序方式. time=时间排序, hits=点击排序, score=评分排序. 默认为"time".
+            genre (str, optional): 动漫类型标签. 如"热血","战斗","奇幻"等. 默认为空字符串.
+            year (str, optional): 年份筛选. 如"2023","2022"等. 默认为空字符串.
+            letter (str, optional): 首字母筛选. 如"A","B"等. 默认为空字符串.
+            page (int, optional): 页码. 默认为1.
+            
+        Returns:
+            List[AnimeShell]: 返回动漫列表,每个元素包含id,name,image_url和status信息
+        """
         params = {
             "id": type,
             "by": order_by,
@@ -274,97 +360,96 @@ class YhdmApi:
 
 
 def test_api():
-    """测试 API 功能"""
-    print("=== 测试开始 ===\n")
-    
     try:
+        print("\n=== 测试开始 ===\n")
+        
+        # 初始化API
         api = YhdmApi()
         
-        # 1. 测试获取首页数据
-        print("1. 获取首页数据:")
-        home_page = api.get_home_page()
-        print("首页数据获取成功!")
-        for item in home_page[:3]:
-            print(f"- {item['title']}")
-            print(f"  状态: {item['status']}")
-            print(f"  图片: {item['image_url']}")
-            print(f"  年份: {item['year']}")
-            print(f"  类型: {item['type']}")
-            print(f"  描述: {item['description'][:100]}...")
-            print()
+        # 测试获取首页数据
+        print("\n获取首页数据测试:")
+        home_data = api.get_homepage()
+        print(f"获取到 {len(home_data)} 个动漫")
+        for anime in home_data[:3]:  # 只显示前3个
+            print(f"\n动漫ID: {anime['id']}")
+            print(f"标题: {anime['title']}")
+            print(f"状态: {anime['status']}")
+            print(f"图片: {anime['image_url']}")
+            print(f"描述: {anime['description']}")
         
-        # 2. 搜索测试
-        print("\n2. 搜索测试:")
-        try:
-            keyword = "异世界"
-            print(f"搜索关键词: {keyword}")
+        # 测试搜索建议
+        keyword = "异世界"
+        print(f"\n搜索建议测试 (关键词: {keyword}):")
+        suggestions = api.get_search_suggestions(keyword)
+        print(f"获取到 {len(suggestions)} 个搜索建议")
+        for suggestion in suggestions:
+            print(f"- {suggestion}")
+        
+        # 测试搜索动漫
+        print(f"\n搜索动漫测试 (关键词: {keyword}):")
+        search_results = api.search_anime(keyword)
+        print(f"获取到 {len(search_results)} 个搜索结果")
+        
+        # 获取第一个搜索结果的ID用于详情测试
+        test_anime_id = None
+        if search_results:
+            first_result = search_results[0]
+            test_anime_id = first_result.id
+            print("\n第一个搜索结果:")
+            print(f"动漫ID: {first_result.id}")
+            print(f"标题: {first_result.name}")
+            print(f"状态: {first_result.status}")
+            print(f"图片: {first_result.image_url}")
+            print(f"描述: {first_result.status}")
+        
+        # 测试过滤动漫
+        print("\n过滤动漫测试 (2023年):")
+        filter_results = api.filter_anime(year="2023")
+        print(f"获取到 {len(filter_results)} 个结果")
+        for anime in filter_results[:3]:  # 只显示前3个
+            print(f"\n动漫ID: {anime.id}")
+            print(f"标题: {anime.name}")
+            print(f"状态: {anime.status}")
+            print(f"图片: {anime.image_url}")
+            print(f"描述: {anime.status}")
+        
+        # 使用搜索结果的第一个动漫ID测试获取详情
+        test_anime_id = 22214
+        if test_anime_id:
+            print(f"\n获取动漫详情测试 (ID: {test_anime_id}):")
+            anime_detail = api.get_anime_detail(test_anime_id)
+            print(f"动漫名称: {anime_detail.name}")
+            print(f"状态: {anime_detail.status}")
+            print(f"描述: {anime_detail.description}")
+            print(f"集数: {anime_detail.latest_episode}")
+            print(f"播放线路数量: {len(anime_detail.stream_lines)}")
             
-            # 获取搜索建议
-            print("\n获取搜索建议...")
-            suggests = api.get_search_suggests(keyword)
-            print(f"搜索建议数量: {len(suggests)}")
-            print("搜索建议:")
-            for suggest in suggests[:5]:
-                print(f"- {suggest}")
+            # 显示每个播放线路的分集列表
+            for line in anime_detail.stream_lines:
+                print(f"\n播放线路 {line.id} 的分集列表:")
+                for episode in line.episodes[:5]:  # 只显示前5集
+                    print(f"  - ID: {episode.id}, 标题: {episode.title}")
+                print(f"  ... 共 {len(line.episodes)} 集")
             
-            # 搜索动漫
-            print("\n搜索动漫...")
-            search_results = api.search_anime(keyword)
-            print(f"搜索结果: 共 {len(search_results)} 个结果")
-            print("第一页结果:")
-            for anime in search_results[:5]:
-                print(f"- {anime.name}")
-            
-        except Exception as e:
-            print(f"搜索测试失败: {e}")
-            import traceback
-            print("错误详情:")
-            print(traceback.format_exc())
-            exit(1)
+            # 测试获取视频URL
+            if anime_detail.stream_lines and anime_detail.stream_lines[0].episodes:
+                first_line = anime_detail.stream_lines[0]
+                first_episode = first_line.episodes[0]
+                video_url = get_video_url(anime_detail.id, 1, first_line.id)
+                print(f"\n视频URL: {video_url}")
+                
+                # 测试获取下一集URL
+                if len(first_line.episodes) > 1:
+                    next_episode = first_line.episodes[1]
+                    next_url = get_video_url(anime_detail.id, 1, next_episode.id)
+                    print(f"下一集URL: {next_url}")
         
-        # 3. 获取动漫详情
-        print("\n3. 获取动漫详情:")
-        try:
-            if search_results:
-                first_anime = search_results[0]
-                detail = api.get_anime_detail(first_anime.id)
-                if detail:
-                    print(f"动漫名称: {detail.name}")
-                    print(f"状态: {detail.status}")
-                    print(f"描述: {detail.description[:100]}...")  # 只显示前100个字符
-                    print(f"集数: {detail.latest_episode}")
-                    print(f"播放源数量: {len(detail.stream_ids)}")
-                    
-                    # 获取第一集和第一个播放源用于后续测试
-                    if detail.stream_ids:
-                        first_stream_id = list(detail.stream_ids)[0]
-                        video_url, next_url = get_video_url(detail.id, 1, first_stream_id)
-                        if video_url:
-                            print(f"\n视频URL: {video_url}")  # 只显示前100个字符
-                            if next_url:
-                                print(f"下一集URL: {next_url}")
-                else:
-                    print("获取动漫详情失败")
-        except Exception as e:
-            print(f"获取动漫详情失败: {e}")
-            exit(1)
+        print("\n=== 测试完成 ===\n")
         
-        # 4. 分类筛选测试
-        print("\n4. 分类筛选测试:")
-        try:
-            filtered = api.filter_anime_by(type=1, year="2023")
-            print(f"2023年动漫: 共 {len(filtered)} 个结果")
-            print("第一页结果:")
-            for anime in filtered[:5]:
-                print(f"- {anime.name}")
-        except Exception as e:
-            print(f"分类筛选测试失败: {e}")
-            exit(1)
-        
-        print("\n=== 测试完成 ===")
     except Exception as e:
-        print(f"测试失败: {e}")
-        exit(1)
+        print(f"测试过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     test_api()
